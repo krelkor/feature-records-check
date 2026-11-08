@@ -38,6 +38,15 @@ assert_contains() {
   return 1
 }
 
+assert_not_contains() {
+  local haystack=$1 needle=$2 msg=$3
+  if [[ "$haystack" != *"$needle"* ]]; then
+    return 0
+  fi
+  fail "$msg" "expected output not to contain '$needle'"
+  return 1
+}
+
 RECORD_BODY='## Sub-features
 
 - view
@@ -325,21 +334,44 @@ EOF
   git -C "$dir" add -A
   git -C "$dir" commit -qm "main base without record"
 
+  local missing_record='feature-records-page: page route / (src/app/page.tsx) has no index row in docs/feature-map/README.md and no record'
+
   out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
-  assert_equals 0 "$rc" "report-only mode exits 0 despite errors"
-  assert_contains "$out" "[ERROR]" "findings are printed in report-only mode"
+  assert_equals 0 "$rc" "report-only mode exits 0 despite findings"
+  assert_equals "[WARNING] $missing_record" "$out" "report-only mode labels findings as warnings"
 
   rc=0
   out=$(bash "$CHECK_SCRIPT" "$dir" --blocking 2>&1) || rc=$?
-  assert_equals 1 "$rc" "--blocking flag forces non-zero exit on errors"
+  assert_equals 1 "$rc" "--blocking flag forces non-zero exit on findings"
+  assert_equals "[ERROR] $missing_record" "$out" "blocking mode labels findings as errors"
 
-  pass "report-only mode exits 0 with findings; --blocking forces exit 1"
+  pass "report-only mode prints warnings and exits 0; --blocking prints errors and exits 1"
+}
+
+test_readme_workflow_example() {
+  local readme="$SCRIPT_DIR/README.md" block
+
+  block=$(awk '/^## Running It in GitHub Actions$/ { found=1 } found && /^```yaml$/ { inside=1; next } inside && /^```$/ { exit } inside { print }' "$readme")
+  if [ -z "$block" ]; then
+    fail "README documents a GitHub Actions workflow example" "no yaml block found under the GitHub Actions heading"
+    return 1
+  fi
+  assert_contains "$block" "on: pull_request_target" "workflow example triggers on pull_request_target"
+  if printf '%s\n' "$block" | grep -qx 'on: pull_request'; then
+    fail "workflow example does not use the pull_request trigger" "found a bare 'on: pull_request' line"
+    return 1
+  fi
+  assert_contains "$block" "ref: v0.1.1" "workflow example pins the current version"
+  assert_not_contains "$block" "ref: v0.1.0" "workflow example does not pin the previous version"
+
+  pass "README workflow example triggers on pull_request_target and pins v0.1.1"
 }
 
 test_next_page_project
 test_file_surface_project
 test_default_surfaces_fallback
 test_report_only_mode
+test_readme_workflow_example
 
 echo "All $passed tests passed!"
 exit 0
