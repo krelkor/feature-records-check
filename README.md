@@ -24,7 +24,7 @@ Projects configure the check in `.agents/pipeline.yaml` on their default branch.
 ### Configuration Keys
 
 - `feature_map` *(string, default: `docs/feature-map`)*: The repository-relative path to the feature records directory containing markdown records and `README.md`.
-- `feature_records.mode` *(string, default: `report-only`)*: Execution mode. `report-only` outputs findings and exits 0; `blocking` exits 1 if any error findings are present.
+- `feature_records.mode` *(string, default: `report-only`)*: Execution mode. `report-only` prints findings as warnings and exits 0; `blocking` prints findings as errors and exits 1 if any error findings are present.
 - `feature_records.blocking_after` *(string, optional)*: Date (`YYYY-MM-DD` or ISO 8601) after which `report-only` mode automatically transitions to `blocking`.
 - `feature_records.surfaces` *(list, optional)*: List of feature surface definitions. Each entry requires `glob` and `kind`. When omitted, defaults to Next.js App Router behaviour (`src/app/**/page.tsx`).
 
@@ -87,7 +87,7 @@ Put this in `.github/workflows/feature-records.yml` in the project.
 
 ```yaml
 name: feature-records
-on: pull_request
+on: pull_request_target
 jobs:
   feature-records:
     runs-on: ubuntu-latest
@@ -95,10 +95,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/checkout@v4
         with:
           repository: krelkor/feature-records-check
-          ref: v0.1.0
+          ref: v0.1.1
           path: .feature-records-check
       - run: pip install pyyaml
       - name: Check feature records
@@ -109,6 +110,8 @@ jobs:
             --base-ref "origin/${{ github.base_ref }}" \
             --pr-body "$PR_BODY"
 ```
+
+The workflow triggers on `pull_request_target`, so its definition comes from the default branch, while the first checkout fetches the pull request head so the checker can read the changed files; nothing from the pull request is executed.
 
 The checker reads the project's rules from the default branch, never from the pull request, so a pull request cannot loosen its own check.
 This workflow is an example and has not yet been run on a hosted runner; confirm it on the first pull request.

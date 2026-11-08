@@ -6,8 +6,8 @@
 # `feature_records` or `feature_map` in `.agents/pipeline.yaml` on their default branch.
 #
 # Mode:
-#   report-only   Prints findings and exits 0. Default during initial rollout.
-#   blocking      Prints findings and exits non-zero (1) on any error.
+#   report-only   Prints findings labelled as warnings and exits 0. Default during initial rollout.
+#   blocking      Prints findings labelled as errors and exits non-zero (1) on any error.
 #   A project transitions from report-only to blocking by setting `mode: blocking`
 #   or `blocking_after: <YYYY-MM-DD>` in `.agents/pipeline.yaml`.
 #
@@ -943,8 +943,12 @@ else:
     if not findings:
         print(f"feature-records [{mode}]: feature records consistent with pages, index and sources")
     for f in findings:
-        sev = f["severity"].upper()
-        print(f"[{sev}] {f['id']}: {f['description']}")
+        sev = f["severity"]
+        # In report-only mode an error cannot fail the build, so it is reported as a
+        # warning; the JSON verdict keeps the machine-readable severity.
+        if mode == "report-only" and sev == "error":
+            sev = "warning"
+        print(f"[{sev.upper()}] {f['id']}: {f['description']}")
 
 has_errors = any(f["severity"] == "error" for f in findings)
 if mode == "blocking" and has_errors:
