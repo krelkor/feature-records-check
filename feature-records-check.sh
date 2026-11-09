@@ -20,6 +20,15 @@
 #   6 A changed `sources` file requires an updated record or PR line `Opt-out: record - <reason>`
 #   7 Each record body has exactly the four level-two section headings
 #
+# Surfaces come from `feature_records.surfaces` and use one of three kinds:
+#   next-page    App Router page files; the id is the derived route.
+#   file         Any repository file; the id is the repository-relative path.
+#   cli-command  A declared command line; the id is the command (argv string).
+#                A cli-command record carries machine-captured `command_evidence`
+#                (command, exit_code, git_sha, database or snapshot, database_view,
+#                output_file, output_hash) and the checker verifies its shape and the
+#                output hash against the evidence file.
+#
 # Usage:
 #   feature-records-check.sh [<project-dir>] [<base-ref>] [options]
 # Options:
@@ -134,6 +143,7 @@ command -v python3 >/dev/null || { echo "error: feature-records-check requires p
 
 exec python3 - "$project" "$base_ref" "$mode_override" "$pr_body_set" "$pr_body" "$evidence_file" "$findings_file" "$json_out" "$sources_of" "$head_ref" <<'PY'
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -280,17 +290,30 @@ def get_surfaces_config():
         for entry in surfaces:
             if isinstance(entry, dict):
                 g = entry.get("glob") or entry.get("pattern") or ""
-                k = entry.get("kind") or entry.get("type") or "file"
-                if g:
-                    res.append({"glob": str(g).strip(), "kind": str(k).strip()})
+                k = str(entry.get("kind") or entry.get("type") or "file").strip()
+                cmds = entry.get("commands", entry.get("cli_commands", []))
+                if isinstance(cmds, str):
+                    cmds = [cmds]
+                cmds = [str(c).strip() for c in cmds if str(c).strip()] if isinstance(cmds, list) else []
+                # cli-command surfaces have no page or file to glob; the declared
+                # command lines are the surfaces. Every other kind still needs a glob.
+                if g or (k == "cli-command" and cmds):
+                    res.append({"glob": str(g).strip(), "kind": k, "commands": cmds})
             elif isinstance(entry, str) and entry.strip():
-                res.append({"glob": entry.strip(), "kind": "file"})
+                res.append({"glob": entry.strip(), "kind": "file", "commands": []})
     return res
 
 
 surfaces_config = get_surfaces_config()
 has_next_page = any(s["kind"] == "next-page" for s in surfaces_config)
 has_file = any(s["kind"] == "file" for s in surfaces_config)
+has_cli_command = any(s["kind"] == "cli-command" for s in surfaces_config)
+cli_commands = []
+for s in surfaces_config:
+    if s["kind"] == "cli-command":
+        for c in s.get("commands", []):
+            if c not in cli_commands:
+                cli_commands.append(c)
 
 
 def glob_to_regex(pat):
@@ -342,6 +365,8 @@ def glob_to_regex(pat):
 
 compiled_surfaces = []
 for sc in surfaces_config:
+    if not sc["glob"]:
+        continue
     compiled_surfaces.append(
         {
             "glob": sc["glob"],
@@ -495,6 +520,151 @@ def source_paths(front):
     return res
 
 
+CLI_COMMAND_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SHA1_RE = re.compile(r"^[0-9a-f]{7,40}$")
+SHA256_RE = re.compile(r"^(?:sha256:)?([0-9a-fA-F]{64})$")
+
+
+def is_command_line(value):
+    """A command record's resource and cited command are argv strings, not paths or routes."""
+    value = str(value or "").strip()
+    if not value or "\n" in value or value.startswith("/"):
+        return False
+    tokens = value.split()
+    return CLI_COMMAND_TOKEN_RE.match(tokens[0]) is not None
+
+
+def repo_relative_problem(raw):
+    """Return a problem string when raw is not a canonical repository-relative path."""
+    if not non_empty_str(raw):
+        return "must be a non-empty repository-relative path"
+    norm = Path(os.path.normpath(raw)).as_posix()
+    if norm != raw or raw.startswith("/") or raw.startswith("../") or raw.startswith("./"):
+        return f"path {raw} must be a canonical repository-relative path"
+    return None
+
+
+def sha256_file(rel_path):
+    try:
+        h = hashlib.sha256()
+        with open(project_dir / rel_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+COMMAND_EVIDENCE_FIELDS = (
+    "command",
+    "exit_code",
+    "git_sha",
+    "database or snapshot",
+    "database_view",
+    "output_file",
+    "output_hash",
+)
+
+
+def command_evidence_problems(front, exists_fn, required):
+    """Check the machine-captured provenance a cli-command record cites for its run."""
+    ev = front.get("command_evidence")
+    if ev is None:
+        if required:
+            return [
+                "command_evidence is required for a cli-command record; carry the captured run: "
+                + ", ".join(COMMAND_EVIDENCE_FIELDS)
+            ]
+        return []
+    if not isinstance(ev, dict):
+        return ["command_evidence must be a mapping of the captured run"]
+    p = []
+
+    cmd = ev.get("command")
+    if not non_empty_str(cmd):
+        p.append("command_evidence.command must be the exact command line that was run")
+    elif not is_command_line(cmd):
+        p.append(f"command_evidence.command {str(cmd).strip()!r} must be a single command line such as `vocaas ingest`")
+    resource = str(front.get("resource") or "").strip()
+    if non_empty_str(cmd) and resource:
+        cited_cmd = str(cmd).strip()
+        if not (cited_cmd == resource or cited_cmd.startswith(resource + " ")):
+            p.append(
+                f"command_evidence.command {cited_cmd!r} does not run the record resource {resource!r}"
+            )
+
+    exit_code = ev.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        p.append("command_evidence.exit_code must be an integer")
+    elif exit_code != 0:
+        p.append(f"command_evidence.exit_code must be 0 for a record that cites a passing run (got {exit_code})")
+
+    sha = ev.get("git_sha")
+    if not non_empty_str(sha) or not SHA1_RE.match(str(sha)):
+        p.append("command_evidence.git_sha must be a lowercase git commit SHA (7-40 hex characters)")
+    else:
+        ok_sha, _ = git_cmd(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])
+        if not ok_sha:
+            p.append(f"command_evidence.git_sha {sha} is not a commit in this repository")
+
+    snapshot = ev.get("snapshot")
+    database = ev.get("database")
+    if not non_empty_str(snapshot) and not non_empty_str(database):
+        p.append("command_evidence needs a database path or a snapshot path for the run")
+    for label, value in (("database", database), ("snapshot", snapshot)):
+        if not non_empty_str(value):
+            continue
+        shape = repo_relative_problem(str(value))
+        if shape:
+            p.append(f"command_evidence.{label} {shape}")
+        # A snapshot is the committed capture of the database; the live database
+        # file itself may be untracked (it is runtime state), so only a snapshot
+        # has to exist in the tree.
+        elif label == "snapshot" and not exists_fn(str(value)):
+            p.append(f"command_evidence.snapshot {value} does not exist")
+
+    view = ev.get("database_view")
+    if not non_empty_str(view):
+        p.append("command_evidence.database_view must name the captured read-only database view")
+    else:
+        shape = repo_relative_problem(str(view))
+        if shape:
+            p.append(f"command_evidence.database_view {shape}")
+        elif not exists_fn(str(view)):
+            p.append(f"command_evidence.database_view {view} does not exist")
+        elif (project_dir / str(view)).is_file() and (project_dir / str(view)).stat().st_size == 0:
+            p.append(f"command_evidence.database_view {view} is empty")
+
+    output_file = ev.get("output_file")
+    output_hash = ev.get("output_hash")
+    out_hash_hex = None
+    if not non_empty_str(output_file):
+        p.append("command_evidence.output_file must name the captured command output")
+    else:
+        shape = repo_relative_problem(str(output_file))
+        if shape:
+            p.append(f"command_evidence.output_file {shape}")
+            output_file = None
+        elif not exists_fn(str(output_file)):
+            p.append(f"command_evidence.output_file {output_file} does not exist")
+            output_file = None
+    if not non_empty_str(output_hash):
+        p.append("command_evidence.output_hash must be the sha256 of the captured output")
+    else:
+        m = SHA256_RE.match(str(output_hash).strip())
+        if not m:
+            p.append("command_evidence.output_hash must be a sha256 hex digest, optionally prefixed `sha256:`")
+        else:
+            out_hash_hex = m.group(1).lower()
+    if output_file and out_hash_hex:
+        actual = sha256_file(str(output_file))
+        if actual is not None and actual != out_hash_hex:
+            p.append(
+                f"command_evidence.output_hash {out_hash_hex} does not match the sha256 of {output_file} ({actual})"
+            )
+    return p
+
+
 def frontmatter_problems(front, exists_fn):
     p = []
     if front.get("type") != "Feature":
@@ -505,8 +675,13 @@ def frontmatter_problems(front, exists_fn):
     res_val = str(front.get("resource") or "")
     if not non_empty_str(front.get("resource")):
         p.append("resource must be a non-empty string")
+    elif has_cli_command and res_val.strip() in cli_commands:
+        pass
     elif not has_file and not res_val.startswith("/"):
-        p.append('resource must be an app route starting with "/"')
+        if has_cli_command and is_command_line(res_val):
+            p.append(f"resource {res_val.strip()!r} is not one of the declared cli-command surfaces")
+        else:
+            p.append('resource must be an app route starting with "/"')
     tags = front.get("tags")
     if not isinstance(tags, list) or not all(non_empty_str(t) for t in tags):
         p.append("tags must be a list of strings")
@@ -746,8 +921,14 @@ else:
             for problem in frontmatter_problems(front, exists_in_tree):
                 add_finding("frontmatter", "error", f"{rp}: {problem}")
 
+            cites_command = non_empty_str(front.get("resource")) and r_resource.strip() in cli_commands
+            if cites_command or front.get("command_evidence") is not None:
+                for problem in command_evidence_problems(front, exists_in_tree, cites_command):
+                    add_finding("command-evidence", "error", f"{rp}: {problem}")
+
             for s in source_paths(front):
-                if not exists_in_tree(s):
+                # A sources entry may name a declared command surface instead of a file.
+                if not exists_in_tree(s) and s not in cli_commands:
                     add_finding("source", "error", f"{rp}: sources path {s} does not exist")
 
             if non_empty_str(front.get("resource")):
@@ -772,7 +953,7 @@ else:
                                 "error",
                                 f'{rp}: index row "{row["feature"]}" lists route {r_first} but the record\'s resource is {r_resource}',
                             )
-                    elif not has_file or r_resource.startswith("/"):
+                    elif (not has_file or r_resource.startswith("/")) and r_resource.strip() not in cli_commands:
                         add_finding(
                             "index-match",
                             "error",
@@ -845,6 +1026,26 @@ else:
                         "surface",
                         "error",
                         f"surface file {f_path} has no feature record covering it (not listed in sources and not named as resource)",
+                    )
+
+        if cli_commands:
+            covered_commands = set(main_excluded + pr_excluded)
+            for rp, content in records.items():
+                front, _, _ = split_record(content)
+                if not front:
+                    continue
+                r_val = front.get("resource")
+                if non_empty_str(r_val):
+                    covered_commands.add(str(r_val).strip())
+                for s in source_paths(front):
+                    covered_commands.add(s)
+
+            for cmd in cli_commands:
+                if cmd not in covered_commands:
+                    add_finding(
+                        "surface",
+                        "error",
+                        f"cli command `{cmd}` has no feature record covering it (not listed in sources and not named as resource)",
                     )
 
         for r in pr_rows:

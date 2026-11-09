@@ -367,11 +367,313 @@ test_readme_workflow_example() {
   pass "README workflow example triggers on pull_request_target and pins v0.1.1"
 }
 
+# --- cli-command surfaces -------------------------------------------------
+
+sha256_of_file() {
+  python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+
+# setup_cli_project <dir> - CLI-only project with captured evidence, no record yet.
+setup_cli_project() {
+  local dir=$1
+  mkdir -p "$dir/.agents" "$dir/src/cli" "$dir/docs/feature-map/evidence"
+  git init -q -b main "$dir"
+  git -C "$dir" config user.email "test@example.com"
+  git -C "$dir" config user.name "tester"
+
+  cat > "$dir/.agents/pipeline.yaml" <<'EOF'
+feature_map: docs/feature-map
+feature_records:
+  mode: blocking
+  surfaces:
+    - kind: cli-command
+      commands:
+        - vocaas ingest
+EOF
+
+  printf 'export const ingest = () => 0;\n' > "$dir/src/cli/ingest.ts"
+  printf '{"items":2,"ok":true}\n' > "$dir/docs/feature-map/evidence/ingest-output.json"
+  printf '{"tables":{"items":2}}\n' > "$dir/docs/feature-map/evidence/ingest-db-view.json"
+  printf '{"schema_version":1,"items":2}\n' > "$dir/docs/feature-map/evidence/vocaas-db.snapshot.json"
+  cat > "$dir/docs/feature-map/README.md" <<'EOF'
+# Feature Map
+
+| Feature | Trigger keywords | Command | Automation | Record |
+|---|---|---|---|---|
+EOF
+
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm "captured evidence without a record"
+}
+
+# write_cli_record <dir> <command_evidence yaml block>
+write_cli_record() {
+  local dir=$1 evidence=$2
+  cat > "$dir/docs/feature-map/ingest.md" <<EOF
+---
+type: Feature
+title: Ingest
+description: Ingest source records into the SQLite database
+resource: vocaas ingest
+tags: [cli, ingest]
+sources:
+  - { id: cli, resource: src/cli/ingest.ts, title: "code: ingest command" }
+generated: { by: "machine:verify-ingest", at: "2026-11-06T12:00:00Z" }
+status: draft
+automation: automated
+runner: scripts/verify-ingest.sh
+number_changing: true
+${evidence}
+---
+
+$RECORD_BODY
+EOF
+  cat > "$dir/docs/feature-map/README.md" <<'EOF'
+# Feature Map
+
+| Feature | Trigger keywords | Command | Automation | Record |
+|---|---|---|---|---|
+| Ingest | ingest | `vocaas ingest` | automated | [ingest.md](ingest.md) |
+EOF
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm "add ingest record"
+}
+
+test_cli_command_project() {
+  local dir="$TMP_DIR/cli_project" out rc=0 sha hash evidence
+  setup_cli_project "$dir"
+  sha=$(git -C "$dir" rev-parse HEAD)
+  hash=$(sha256_of_file "$dir/docs/feature-map/evidence/ingest-output.json")
+  evidence=$(cat <<EOF
+command_evidence:
+  command: "vocaas ingest --db data/vocaas.db"
+  exit_code: 0
+  git_sha: "$sha"
+  database: data/vocaas.db
+  snapshot: docs/feature-map/evidence/vocaas-db.snapshot.json
+  database_view: docs/feature-map/evidence/ingest-db-view.json
+  output_file: docs/feature-map/evidence/ingest-output.json
+  output_hash: "sha256:$hash"
+EOF
+)
+  write_cli_record "$dir" "$evidence"
+
+  out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
+  assert_equals 0 "$rc" "cli-command project with captured evidence passes"
+  assert_contains "$out" "feature records consistent" "passing cli-command project reports consistency"
+  assert_not_contains "$out" "[ERROR]" "passing cli-command project has no error findings"
+
+  # A declared command with no covering record fails in blocking mode.
+  cat > "$dir/.agents/pipeline.yaml" <<'EOF'
+feature_map: docs/feature-map
+feature_records:
+  mode: blocking
+  surfaces:
+    - kind: cli-command
+      commands:
+        - vocaas ingest
+        - vocaas export
+EOF
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm "declare an uncovered command"
+
+  rc=0
+  out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
+  assert_equals 1 "$rc" "declared command without a record fails in blocking mode"
+  assert_contains "$out" 'cli command `vocaas export` has no feature record covering it' "failure names the uncovered command"
+
+  pass "cli-command project: evidence passes, uncovered command fails"
+}
+
+test_cli_command_missing_provenance() {
+  local dir="$TMP_DIR/cli_missing_evidence" out rc=0 sha hash evidence
+  setup_cli_project "$dir"
+  sha=$(git -C "$dir" rev-parse HEAD)
+  hash=$(sha256_of_file "$dir/docs/feature-map/evidence/ingest-output.json")
+
+  # Partial provenance: no database_view, no output_hash.
+  evidence=$(cat <<EOF
+command_evidence:
+  command: "vocaas ingest --db data/vocaas.db"
+  exit_code: 0
+  git_sha: "$sha"
+  database: data/vocaas.db
+  output_file: docs/feature-map/evidence/ingest-output.json
+EOF
+)
+  write_cli_record "$dir" "$evidence"
+
+  rc=0
+  out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
+  assert_equals 1 "$rc" "record with partial provenance fails"
+  assert_contains "$out" "command_evidence.database_view must name the captured read-only database view" "missing database view is reported"
+  assert_contains "$out" "command_evidence.output_hash must be the sha256 of the captured output" "missing output hash is reported"
+
+  # No provenance at all.
+  write_cli_record "$dir" ""
+  rc=0
+  out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
+  assert_equals 1 "$rc" "record without provenance fails"
+  assert_contains "$out" "command_evidence is required for a cli-command record" "absent evidence block is reported"
+
+  pass "cli-command provenance: missing fields and absent block fail"
+}
+
+test_cli_command_output_hash_mismatch() {
+  local dir="$TMP_DIR/cli_hash_mismatch" out rc=0 sha evidence
+  local wrong_hash='0000000000000000000000000000000000000000000000000000000000000000'
+  setup_cli_project "$dir"
+  sha=$(git -C "$dir" rev-parse HEAD)
+  evidence=$(cat <<EOF
+command_evidence:
+  command: "vocaas ingest --db data/vocaas.db"
+  exit_code: 0
+  git_sha: "$sha"
+  database: data/vocaas.db
+  snapshot: docs/feature-map/evidence/vocaas-db.snapshot.json
+  database_view: docs/feature-map/evidence/ingest-db-view.json
+  output_file: docs/feature-map/evidence/ingest-output.json
+  output_hash: "sha256:$wrong_hash"
+EOF
+)
+  write_cli_record "$dir" "$evidence"
+
+  rc=0
+  out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
+  assert_equals 1 "$rc" "record whose output hash does not match its evidence file fails"
+  assert_contains "$out" "command_evidence.output_hash $wrong_hash does not match the sha256 of docs/feature-map/evidence/ingest-output.json" "hash mismatch names the evidence file"
+
+  # Same finding is a warning in report-only mode, as for every other kind.
+  rc=0
+  out=$(bash "$CHECK_SCRIPT" "$dir" --report-only 2>&1) || rc=$?
+  assert_equals 0 "$rc" "report-only mode does not block on a command evidence finding"
+  assert_contains "$out" "[WARNING] feature-records-command-evidence:" "report-only mode labels the finding as a warning"
+
+  pass "cli-command evidence: output hash is verified and report-only stays non-blocking"
+}
+
+test_existing_kinds_with_cli_command() {
+  local dir="$TMP_DIR/mixed_kinds" out rc=0 sha hash evidence
+  mkdir -p "$dir/.agents" "$dir/handlers" "$dir/src/cli" "$dir/docs/features/evidence"
+  git init -q -b main "$dir"
+  git -C "$dir" config user.email "test@example.com"
+  git -C "$dir" config user.name "tester"
+
+  cat > "$dir/.agents/pipeline.yaml" <<'EOF'
+feature_map: docs/features
+feature_records:
+  mode: blocking
+  surfaces:
+    - glob: "handlers/*.py"
+      kind: file
+    - kind: cli-command
+      commands:
+        - vocaas ingest
+EOF
+
+  printf 'def handle_auth(): return True\n' > "$dir/handlers/auth.py"
+  printf 'export const ingest = () => 0;\n' > "$dir/src/cli/ingest.ts"
+  printf '{"items":2}\n' > "$dir/docs/features/evidence/ingest-output.json"
+  printf '{"tables":{"items":2}}\n' > "$dir/docs/features/evidence/ingest-db-view.json"
+
+  cat > "$dir/docs/features/auth.md" <<EOF
+---
+type: Feature
+title: Authentication
+description: User authentication handler
+resource: handlers/auth.py
+tags: [auth]
+sources:
+  - { id: handler, resource: handlers/auth.py, title: "Auth handler" }
+generated: { by: "test", at: "2026-11-06T12:00:00Z" }
+status: draft
+automation: mapped
+number_changing: false
+---
+
+$RECORD_BODY
+EOF
+
+  cat > "$dir/docs/features/README.md" <<'EOF'
+# Features
+
+| Feature | Trigger keywords | Resource | Automation | Record |
+|---|---|---|---|---|
+| Authentication | auth | `handlers/auth.py` | mapped | [auth.md](auth.md) |
+EOF
+
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm "file surface and cli evidence without a command record"
+  sha=$(git -C "$dir" rev-parse HEAD)
+  hash=$(sha256_of_file "$dir/docs/features/evidence/ingest-output.json")
+  evidence=$(cat <<EOF
+command_evidence:
+  command: "vocaas ingest --db data/vocaas.db"
+  exit_code: 0
+  git_sha: "$sha"
+  database: data/vocaas.db
+  database_view: docs/features/evidence/ingest-db-view.json
+  output_file: docs/features/evidence/ingest-output.json
+  output_hash: "sha256:$hash"
+EOF
+)
+  cat > "$dir/docs/features/ingest.md" <<EOF
+---
+type: Feature
+title: Ingest
+description: Ingest source records into the SQLite database
+resource: vocaas ingest
+tags: [cli, ingest]
+sources:
+  - { id: cli, resource: src/cli/ingest.ts, title: "code: ingest command" }
+generated: { by: "machine:verify-ingest", at: "2026-11-06T12:00:00Z" }
+status: draft
+automation: mapped
+number_changing: false
+${evidence}
+---
+
+$RECORD_BODY
+EOF
+
+  cat > "$dir/docs/features/README.md" <<'EOF'
+# Features
+
+| Feature | Trigger keywords | Resource | Automation | Record |
+|---|---|---|---|---|
+| Authentication | auth | `handlers/auth.py` | mapped | [auth.md](auth.md) |
+| Ingest | ingest | `vocaas ingest` | mapped | [ingest.md](ingest.md) |
+EOF
+
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm "add ingest record beside the file surface"
+
+  out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
+  assert_equals 0 "$rc" "file and cli-command surfaces coexist and pass"
+
+  # The file kind still enforces coverage when a cli-command surface is configured.
+  printf 'def handle_orders(): return True\n' > "$dir/handlers/orders.py"
+  git -C "$dir" add -A
+  git -C "$dir" commit -qm "add an uncovered file surface"
+
+  rc=0
+  out=$(bash "$CHECK_SCRIPT" "$dir" 2>&1) || rc=$?
+  assert_equals 1 "$rc" "file surface coverage still fails when cli-command is configured"
+  assert_contains "$out" "handlers/orders.py" "failure names the uncovered file"
+
+  pass "existing file kind keeps its behaviour beside the new cli-command kind"
+}
+
+# Existing kinds' test functions above are unchanged; they run verbatim here.
 test_next_page_project
 test_file_surface_project
 test_default_surfaces_fallback
 test_report_only_mode
 test_readme_workflow_example
+test_cli_command_project
+test_cli_command_missing_provenance
+test_cli_command_output_hash_mismatch
+test_existing_kinds_with_cli_command
 
 echo "All $passed tests passed!"
 exit 0
